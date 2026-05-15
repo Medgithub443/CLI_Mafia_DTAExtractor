@@ -7,10 +7,10 @@ This is a stripped-down CLI fork of [Richard01CZ/Mafia_DTAExtractor](https://git
 
 ## Usage
 
-```
+
 dta_cli.exe extract <file.dta> [-o <output-dir>] [-q]
 dta_cli.exe list
-```
+
 
 ### Examples
 
