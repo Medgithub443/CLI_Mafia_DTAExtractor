@@ -1,8 +1,17 @@
 // =============================================================
 // MAFIA: THE CITY OF LOST HEAVEN - DTA EXTRACTOR (CLI)
+// v1.1.0 Beta
 // Adapted from Richard01CZ/Mafia_DTAExtractor (MIT-style notice in repo)
 // Stripped to CLI for batch use from Mafia Mod Installer.
+//
+// v1.1.0: added "extract-all" (unpacks every .dta in a folder with the
+// patch archive A8.dta ALWAYS extracted last, mirroring the upstream GUI
+// tool), "extract-safe" (single extract + A8.dta auto-applied right after)
+// and "version". A8.dta holds patched copies of files that also exist in
+// A1/A2/A6/AA; extracting it before them leaves the game with unpatched
+// tables/models (broken menu strings, mission crashes).
 // =============================================================
+#define DTA_CLI_VERSION "1.1.0 Beta"
 #define _WIN32_WINNT 0x0501
 #define _CRT_SECURE_NO_WARNINGS
 
@@ -357,7 +366,9 @@ static int ExtractDta(const std::string& dtaPath, const std::string& outDir, boo
         file.seekg(dataStart, std::ios::beg);
 
         std::vector<char> finalData;
-        finalData.reserve(fh.FileSize);
+        // fh comes from decrypted data; a corrupt entry must not make us
+        // reserve gigabytes. No valid Mafia asset is anywhere near 1 GiB.
+        if (fh.FileSize < 0x40000000u) finalData.reserve(fh.FileSize);
 
         bool wavHeaderRead = false;
         WavHeader wavHeader{};
@@ -431,6 +442,104 @@ static int ExtractDta(const std::string& dtaPath, const std::string& outDir, boo
     return extracted;
 }
 
+// Extract every .dta found in `dir` into `outDir` (or into `dir` itself
+// when outDir is empty). Order matters: A8.dta is the patch archive and
+// carries updated copies of files from A1/A2/A6/A9/AA, so it must always
+// be unpacked last - the upstream GUI tool enforces the same rule.
+// Returns 0 on success, 1 if any archive failed.
+static int CmdExtractAll(const std::string& dir, const std::string& outDir, bool quiet) {
+    std::vector<std::string> dtas;
+    WIN32_FIND_DATAA ffd;
+    HANDLE hFind = FindFirstFileA((dir + "\\*.dta").c_str(), &ffd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ERROR: no .dta files found in %s\n", dir.c_str());
+        return 1;
+    }
+    do {
+        if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            dtas.push_back(ffd.cFileName);
+    } while (FindNextFileA(hFind, &ffd));
+    FindClose(hFind);
+
+    std::sort(dtas.begin(), dtas.end(), [](const std::string& a, const std::string& b) {
+        std::string ua = ToUpper(a), ub = ToUpper(b);
+        if (ua != ub) return ua < ub;
+        return a < b;
+    });
+    // Keep alphabetical order, but move A8.dta to the very end.
+    std::stable_sort(dtas.begin(), dtas.end(),
+        [](const std::string& a, const std::string&) { return ToUpper(a) != "A8.DTA"; });
+
+    std::string target = outDir.empty() ? dir : outDir;
+    char absBuf[MAX_PATH] = { 0 };
+    if (GetFullPathNameA(target.c_str(), MAX_PATH, absBuf, NULL)) target = absBuf;
+
+    int total = 0, failed = 0;
+    for (const auto& name : dtas) {
+        if (!quiet) fprintf(stderr, "== %s\n", name.c_str());
+        int n = ExtractDta(dir + "\\" + name, target, quiet);
+        if (n < 0) { failed++; fprintf(stderr, "ERROR: %s failed\n", name.c_str()); }
+        else total += n;
+    }
+    if (!quiet) {
+        fprintf(stderr, "DONE: %d files from %d archives", total, (int)dtas.size() - failed);
+        if (failed) fprintf(stderr, ", %d FAILED", failed);
+        fprintf(stderr, "\n");
+    }
+    return failed ? 1 : 0;
+}
+
+// Look for the patch archive A8.dta (any letter case) in `dir`.
+// Returns its file name, or empty string if not found.
+static std::string FindPatchDta(const std::string& dir) {
+    WIN32_FIND_DATAA ffd;
+    HANDLE hFind = FindFirstFileA((dir + "\\*").c_str(), &ffd);
+    if (hFind == INVALID_HANDLE_VALUE) return "";
+    std::string found;
+    do {
+        if (!(ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            ToUpper(ffd.cFileName) == "A8.DTA") {
+            found = ffd.cFileName;
+            break;
+        }
+    } while (FindNextFileA(hFind, &ffd));
+    FindClose(hFind);
+    return found;
+}
+
+// Directory part of an absolute path (without trailing separator).
+static std::string DirName(const std::string& p) {
+    size_t s = p.find_last_of("/\\");
+    return (s == std::string::npos) ? "" : p.substr(0, s);
+}
+
+// "extract" + guarantee that the A8.dta patch archive (looked up next to the
+// source file, applied into the same output dir) is always unpacked after it.
+// This keeps loose files in the patched state even when only one base archive
+// is requested - the failure mode this prevents is base archives overwriting
+// patched tables/models with their older originals.
+static int CmdExtractSafe(const std::string& dtaAbs, const std::string& outDir, bool quiet) {
+    int n = ExtractDta(dtaAbs, outDir, quiet);
+    if (n < 0) return 1;
+    if (!quiet) fprintf(stderr, "DONE: %d files\n", n);
+
+    std::string fname = BaseName(dtaAbs);
+    if (ToUpper(fname) == "A8.DTA") return 0; // it IS the patch archive
+
+    std::string dir = DirName(dtaAbs);
+    std::string patch = FindPatchDta(dir);
+    if (patch.empty()) {
+        if (!quiet) fprintf(stderr, "note: A8.dta not found next to %s - patches not applied\n",
+                            fname.c_str());
+        return 0;
+    }
+    if (!quiet) fprintf(stderr, "== %s (patches)\n", patch.c_str());
+    int m = ExtractDta(dir + "\\" + patch, outDir, quiet);
+    if (m < 0) return 1;
+    if (!quiet) fprintf(stderr, "DONE: %d files (patches)\n", m);
+    return 0;
+}
+
 static int CmdList() {
     printf("Known DTA files (from DTA_MAP):\n");
     for (auto& kv : DTA_MAP) {
@@ -441,22 +550,35 @@ static int CmdList() {
 
 static void Usage() {
     fprintf(stderr,
-        "DTA Extractor CLI (Mafia: The City of Lost Heaven)\n"
+        "DTA Extractor CLI (Mafia: The City of Lost Heaven) v%s\n"
         "Usage:\n"
         "  dta_cli.exe extract <path-to-dta> [-o <output-dir>] [-q]\n"
+        "  dta_cli.exe extract-safe <path-to-dta> [-o <output-dir>] [-q]\n"
+        "  dta_cli.exe extract-all <dir-with-dtas> [-o <output-dir>] [-q]\n"
         "  dta_cli.exe list\n"
+        "  dta_cli.exe version\n"
         "Notes:\n"
+        "  - extract-safe = extract + A8.dta (patch archive) auto-applied from the\n"
+        "    same folder right after; use it whenever a single base archive is\n"
+        "    unpacked, so patched tables/models are not shadowed by old originals.\n"
+        "  - extract-all unpacks every .dta in <dir>; A8.dta is always extracted\n"
+        "    LAST. Without -o it writes into <dir> itself.\n"
+        "  - extract (single file) writes into the current dir unless -o is given.\n"
         "  - <output-dir> is created if missing; extraction is relative to it.\n"
-        "  - exit code = files extracted (>=0) or 1 on error.\n");
+        "  - exit code: 0 = success, 1 = error.\n", DTA_CLI_VERSION);
 }
 
 int main(int argc, char** argv) {
     if (argc < 2) { Usage(); return 1; }
     std::string cmd = argv[1];
+    if (cmd == "version" || cmd == "--version" || cmd == "-v") {
+        printf("dta_cli %s\n", DTA_CLI_VERSION);
+        return 0;
+    }
     if (cmd == "list") return CmdList();
-    if (cmd == "extract") {
+    if (cmd == "extract" || cmd == "extract-all" || cmd == "extract-safe") {
         if (argc < 3) { Usage(); return 1; }
-        std::string dtaPath = argv[2];
+        std::string path = argv[2];
         std::string outDir;
         bool quiet = false;
         for (int i = 3; i < argc; ++i) {
@@ -464,10 +586,17 @@ int main(int argc, char** argv) {
             if (a == "-o" && i + 1 < argc) { outDir = argv[++i]; }
             else if (a == "-q") quiet = true;
         }
-        // resolve absolute path of dta before chdir
-        char abs[MAX_PATH] = { 0 };
-        if (GetFullPathNameA(dtaPath.c_str(), MAX_PATH, abs, NULL)) dtaPath = abs;
-        int n = ExtractDta(dtaPath, outDir, quiet);
+        if (cmd == "extract-all")
+            return CmdExtractAll(path, outDir, quiet);
+
+        // resolve absolute path of dta and outdir before any chdir
+        char absBuf[MAX_PATH] = { 0 };
+        if (GetFullPathNameA(path.c_str(), MAX_PATH, absBuf, NULL)) path = absBuf;
+        if (!outDir.empty() && GetFullPathNameA(outDir.c_str(), MAX_PATH, absBuf, NULL)) outDir = absBuf;
+        if (cmd == "extract-safe")
+            return CmdExtractSafe(path, outDir, quiet);
+
+        int n = ExtractDta(path, outDir, quiet);
         if (n < 0) return 1;
         if (!quiet) fprintf(stderr, "DONE: %d files\n", n);
         return 0;
